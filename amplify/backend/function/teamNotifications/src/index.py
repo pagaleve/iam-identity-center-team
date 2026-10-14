@@ -88,11 +88,12 @@ def escape_slack_text(text):
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def slack_messages(status, requester, approver, comment, error, mention, mention_all):
+def slack_messages(status, requester, approver, comment, mention, mention_all):
     """Returns (direct message, channel message, thread reply) in pt-BR for a request status.
 
     The direct message goes to the Slack recipients of the status (only the requester).
-    The channel message is None for statuses that are not posted to the channel.
+    Each message is None when that status is not sent there; statuses missing from the
+    match (scheduled, expired, cancelled, error) are not sent to Slack at all.
     The thread reply is used instead of the channel message when the request post is
     found in the channel, and is None for statuses that start a new post.
     """
@@ -104,10 +105,6 @@ def slack_messages(status, requester, approver, comment, error, mention, mention
                 f"🔐 *Nova solicitação de acesso AWS*\n{mention(requester)} pediu acesso — {mention_all()}, podem revisar?",
                 None,
             )
-        case "scheduled":
-            return ("🗓️ Sua sessão de acesso AWS foi agendada.", None, None)
-        case "expired":
-            return ("⌛ Sua solicitação de acesso AWS expirou sem ser revisada.", None, None)
         case "ended":
             return ("⚪ Sua sessão de acesso AWS foi encerrada.", None, None)
         case "granted":
@@ -124,18 +121,8 @@ def slack_messages(status, requester, approver, comment, error, mention, mention
                 f"❌ Solicitação de acesso AWS de {mention(requester)} recusada por {mention(approver)}.{reason}",
                 f"❌ Recusada por {mention(approver)}.{reason}",
             )
-        case "cancelled":
-            return (
-                None,
-                f"🚫 {mention(requester)} cancelou a solicitação de acesso AWS.",
-                f"🚫 Cancelada por {mention(requester)}.",
-            )
-        case "error":
-            return (
-                f"⚠️ Erro ao processar o seu acesso AWS. O time responsável foi avisado. Detalhes: {error}",
-                f"⚠️ Erro ao processar o acesso AWS de {mention(requester)}. Detalhes: {error}",
-                f"⚠️ Erro ao processar o acesso. Detalhes: {error}",
-            )
+        case _:
+            return (None, None, None)
 
 
 def find_slack_request_post(slack_client, channel, request_id):
@@ -207,7 +194,6 @@ def send_slack_notifications(
     approver,
     approvers,
     comment,
-    error,
     team_url,
     request_start_time,
     role,
@@ -253,7 +239,7 @@ def send_slack_notifications(
         return ", ".join(mention(email) for email in approvers or []) or "aprovadores"
 
     direct_message, channel_message, thread_reply = slack_messages(
-        status, requester, approver, comment, error, mention, mention_all
+        status, requester, approver, comment, mention, mention_all
     )
 
     # Pending requests send approvers straight to the approvals page
@@ -466,14 +452,14 @@ def lambda_handler(event: dict, context):
             subject = f"AWS access request rejected for {account}"
             email_message_html = f'<html><body><p>Your AWS access request has been rejected. Open <a href="{login_url}">TEAM</a> to manage AWS access requests.</p><p><b>Account:</b> {account}<br /><b>Role:</b> {role}<br /><b>Start Time:</b> {request_start_time}<br /><b>Duration:</b> {duration_hours} hours<br /><b>Justification:</b> {justification}<br /><b>Ticket Number:</b> {ticket}<br /></p></body></html>'
         case "cancelled":
-            # Notify approvers request cancelled (Slack: via channel only)
+            # Notify approvers request cancelled (not sent to Slack)
             slack_recipients = []
             email_to_addresses = approvers
             email_cc_addresses = [requester]
             subject = f"AWS access request cancelled for {account}"
             email_message_html = f'<html><body><p>{requester} cancelled an AWS access request. Open <a href="{login_url}">TEAM</a> to manage AWS access requests.</p><p><b>Account:</b> {account}<br /><b>Role:</b> {role}<br /><b>Start Time:</b> {request_start_time}<br /><b>Duration:</b> {duration_hours} hours<br /><b>Justification:</b> {justification}<br /><b>Ticket Number:</b> {ticket}<br /></p></body></html>'
         case "error":
-            # Notify approvers and requester error (Slack: approvers via channel)
+            # Notify approvers and requester error (not sent to Slack)
             slack_recipients = [requester]
             email_to_addresses = [ses_source_email]
             email_cc_addresses = approvers + [requester]
@@ -509,7 +495,6 @@ def lambda_handler(event: dict, context):
             approver=event.get("approver", ""),
             approvers=approvers,
             comment=event.get("comment") or "",
-            error=event.get("statusError"),
             team_url=team_url,
             role=role,
             account=account,
