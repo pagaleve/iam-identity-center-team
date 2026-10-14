@@ -77,41 +77,72 @@ def send_sns_notification(notification_topic_arn, message, subject):
 
 
 SLACK_CHANNEL_TIMEZONE = tz.gettz("America/Sao_Paulo")
+SLACK_REQUEST_EVENT_TYPE = "team_access_request"
+# How far back (in messages) to look for the request post in the channel
+SLACK_THREAD_SEARCH_PAGES = 5
+SLACK_THREAD_SEARCH_PAGE_SIZE = 200
 
 
 def slack_messages(status, requester, approver, error, mention, mention_all):
-    """Returns (direct message, channel message) in pt-BR for a request status.
+    """Returns (direct message, channel message, thread reply) in pt-BR for a request status.
 
     The channel message is None for statuses that are not posted to the channel.
+    The thread reply is used instead of the channel message when the request post is
+    found in the channel, and is None for statuses that start a new post.
     """
     match status:
         case "pending":
             return (
                 f"🔐 {mention(requester)} pediu acesso à AWS. Revise a solicitação e aprove ou recuse no TEAM.",
                 f"🔐 *Nova solicitação de acesso AWS*\n{mention(requester)} pediu acesso — {mention_all()}, podem revisar?",
+                None,
             )
         case "scheduled":
-            return ("🗓️ Sua sessão de acesso AWS foi agendada.", None)
+            return ("🗓️ Sua sessão de acesso AWS foi agendada.", None, None)
         case "expired":
-            return ("⌛ Sua solicitação de acesso AWS expirou sem ser revisada.", None)
+            return ("⌛ Sua solicitação de acesso AWS expirou sem ser revisada.", None, None)
         case "ended":
-            return ("⚪ Sua sessão de acesso AWS foi encerrada.", None)
+            return ("⚪ Sua sessão de acesso AWS foi encerrada.", None, None)
         case "granted":
-            return ("🟢 Sua sessão de acesso AWS começou.", None)
+            return ("🟢 Sua sessão de acesso AWS começou.", None, None)
         case "approved":
             message = f"✅ Solicitação de acesso AWS de {mention(requester)} aprovada por {mention(approver)}."
-            return (message, message)
+            return (message, message, f"✅ Aprovada por {mention(approver)}.")
         case "rejected":
             message = f"❌ Solicitação de acesso AWS de {mention(requester)} recusada por {mention(approver)}."
-            return (message, message)
+            return (message, message, f"❌ Recusada por {mention(approver)}.")
         case "cancelled":
             message = f"🚫 {mention(requester)} cancelou a solicitação de acesso AWS."
-            return (message, message)
+            return (message, message, f"🚫 Cancelada por {mention(requester)}.")
         case "error":
             return (
                 f"⚠️ Erro ao processar o acesso AWS de {mention(requester)}. Detalhes: {error}",
                 None,
+                None,
             )
+
+
+def find_slack_request_post(slack_client, channel, request_id):
+    """Returns the ts of the channel post for this request, or None if not found."""
+    cursor = None
+    for _ in range(SLACK_THREAD_SEARCH_PAGES):
+        response = slack_client.conversations_history(
+            channel=channel,
+            limit=SLACK_THREAD_SEARCH_PAGE_SIZE,
+            include_all_metadata=True,
+            cursor=cursor,
+        )
+        for message in response.get("messages", []):
+            metadata = message.get("metadata") or {}
+            if (
+                metadata.get("event_type") == SLACK_REQUEST_EVENT_TYPE
+                and metadata.get("event_payload", {}).get("request_id") == request_id
+            ):
+                return message["ts"]
+        cursor = response.get("response_metadata", {}).get("next_cursor")
+        if not cursor:
+            break
+    return None
 
 
 def format_slack_date(start_time, timezone_):
@@ -153,6 +184,7 @@ def slack_blocks(message, button, account, role, start_time, duration_hours, jus
 
 
 def send_slack_notifications(
+    request_id,
     status,
     recipients,
     requester,
@@ -203,7 +235,7 @@ def send_slack_notifications(
     def mention_all():
         return ", ".join(mention(email) for email in approvers or []) or "aprovadores"
 
-    direct_message, channel_message = slack_messages(
+    direct_message, channel_message, thread_reply = slack_messages(
         status, requester, approver, error, mention, mention_all
     )
 
@@ -249,6 +281,31 @@ def send_slack_notifications(
 
     # send audit notifications to channel if defined
     if slack_audit_notifications_channel and channel_message:
+        # Updates go in the thread of the request post, when it can be found
+        if thread_reply and request_id:
+            try:
+                thread_ts = find_slack_request_post(
+                    slack_client, slack_audit_notifications_channel, request_id
+                )
+            except Exception as error:
+                print(
+                    f"Error searching request post in channel {slack_audit_notifications_channel} (ensure the app has the channels:history/groups:history scope): {error}"
+                )
+                thread_ts = None
+
+            if thread_ts:
+                try:
+                    slack_client.chat_postMessage(
+                        channel=slack_audit_notifications_channel,
+                        thread_ts=thread_ts,
+                        text=thread_reply,
+                    )
+                    return
+                except Exception as error:
+                    print(
+                        f"Error posting thread reply to channel {slack_audit_notifications_channel}: {error}"
+                    )
+
         try:
             slack_client.chat_postMessage(
                 channel=slack_audit_notifications_channel,
@@ -263,6 +320,13 @@ def send_slack_notifications(
                     justification,
                     ticket,
                 ),
+                # Lets later updates find this post to reply in its thread
+                metadata={
+                    "event_type": SLACK_REQUEST_EVENT_TYPE,
+                    "event_payload": {"request_id": request_id},
+                }
+                if request_id and status == "pending"
+                else None,
             )
         except Exception as error:
             print(
@@ -421,6 +485,7 @@ def lambda_handler(event: dict, context):
 
     if slack_notifications_enabled:
         send_slack_notifications(
+            request_id=event.get("id", ""),
             status=request_status,
             recipients=slack_recipients,
             requester=requester,
