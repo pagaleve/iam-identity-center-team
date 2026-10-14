@@ -8,6 +8,8 @@ const path = require("path");
 
 const { AWS_APP_ID, AWS_BRANCH, SSO_LOGIN, TEAM_ADMIN_GROUP, TEAM_AUDITOR_GROUP, TAGS, CLOUDTRAIL_AUDIT_LOGS, TEAM_ACCOUNT, AMPLIFY_CUSTOM_DOMAIN } = process.env;
 
+const amplifyDomain = AMPLIFY_CUSTOM_DOMAIN ? `https://${AMPLIFY_CUSTOM_DOMAIN}/` :`https://${AWS_BRANCH}.${AWS_APP_ID}.amplifyapp.com/`
+
 async function update_auth_parameters() {
   console.log(`updating amplify config for branch "${AWS_BRANCH}"...`);
   // update callback/logout redirect urls for build url
@@ -24,8 +26,6 @@ async function update_auth_parameters() {
   );
   oAuthMetadata.CallbackURLs.pop();
   oAuthMetadata.LogoutURLs.pop();
-
-  const amplifyDomain = AMPLIFY_CUSTOM_DOMAIN ? `https://${AMPLIFY_CUSTOM_DOMAIN}/` :`https://${AWS_BRANCH}.${AWS_APP_ID}.amplifyapp.com/`
 
   console.log("domain",amplifyDomain)
   oAuthMetadata.CallbackURLs.push(amplifyDomain);
@@ -98,6 +98,22 @@ async function update_router_parameters() {
   );
 }
 
+async function update_notifications_parameters() {
+  console.log(`updating teamNotifications lambda parameters"...`);
+
+  const notificationsParametersJsonPath = path.resolve(
+    `./amplify/backend/function/teamNotifications/parameters.json`
+  );
+  const notificationsParametersJson = require(notificationsParametersJsonPath);
+
+  notificationsParametersJson.TeamUrl = amplifyDomain;
+
+  fs.writeFileSync(
+    notificationsParametersJsonPath,
+    JSON.stringify(notificationsParametersJson, null, 4)
+  );
+}
+
 async function update_tag_parameters() {
   console.log(`updating amplify/backend/tags.json"...`);
 
@@ -154,5 +170,6 @@ update_auth_parameters();
 update_react_parameters();
 update_groups_parameters();
 update_router_parameters()
+update_notifications_parameters();
 update_tag_parameters();
 update_cloudtrail_parameters();

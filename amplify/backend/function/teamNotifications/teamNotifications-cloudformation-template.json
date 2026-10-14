@@ -2,6 +2,10 @@
   "AWSTemplateFormatVersion": "2010-09-09",
   "Description": "{\"createdOn\":\"Linux\",\"createdBy\":\"Amplify\",\"createdWith\":\"9.2.1\",\"stackType\":\"function-Lambda\",\"metadata\":{}}",
   "Parameters": {
+    "TeamUrl": {
+      "Type": "String",
+      "Default": ""
+    },
     "deploymentBucketName": {
       "Type": "String"
     },
@@ -80,6 +84,9 @@
               "Fn::ImportValue": {
                 "Fn::Sub": "${apiteamGraphQLAPIIdOutput}:GetAtt:SettingsTable:Name"
               }
+            },
+            "TEAM_URL": {
+              "Ref": "TeamUrl"
             }
           }
         },

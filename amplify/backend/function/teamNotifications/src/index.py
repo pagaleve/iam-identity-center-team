@@ -76,11 +76,90 @@ def send_sns_notification(notification_topic_arn, message, subject):
         print(f"Error publishing message to SNS: {e}")
 
 
+SLACK_CHANNEL_TIMEZONE = tz.gettz("America/Sao_Paulo")
+
+
+def slack_messages(status, requester, approver, error, mention, mention_all):
+    """Returns (direct message, channel message) in pt-BR for a request status.
+
+    The channel message is None for statuses that are not posted to the channel.
+    """
+    match status:
+        case "pending":
+            return (
+                f"🔐 {mention(requester)} pediu acesso à AWS. Revise a solicitação e aprove ou recuse no TEAM.",
+                f"🔐 *Nova solicitação de acesso AWS*\n{mention(requester)} pediu acesso — {mention_all()}, podem revisar?",
+            )
+        case "scheduled":
+            return ("🗓️ Sua sessão de acesso AWS foi agendada.", None)
+        case "expired":
+            return ("⌛ Sua solicitação de acesso AWS expirou sem ser revisada.", None)
+        case "ended":
+            return ("⚪ Sua sessão de acesso AWS foi encerrada.", None)
+        case "granted":
+            return ("🟢 Sua sessão de acesso AWS começou.", None)
+        case "approved":
+            message = f"✅ Solicitação de acesso AWS de {mention(requester)} aprovada por {mention(approver)}."
+            return (message, message)
+        case "rejected":
+            message = f"❌ Solicitação de acesso AWS de {mention(requester)} recusada por {mention(approver)}."
+            return (message, message)
+        case "cancelled":
+            message = f"🚫 {mention(requester)} cancelou a solicitação de acesso AWS."
+            return (message, message)
+        case "error":
+            return (
+                f"⚠️ Erro ao processar o acesso AWS de {mention(requester)}. Detalhes: {error}",
+                None,
+            )
+
+
+def format_slack_date(start_time, timezone_):
+    localized_date = parser.parse(start_time).astimezone(timezone_)
+    return localized_date.strftime("%d/%m/%Y às %H:%M")
+
+
+def format_slack_duration(duration_hours):
+    return f"{duration_hours} hora" if str(duration_hours) == "1" else f"{duration_hours} horas"
+
+
+def slack_blocks(message, button, account, role, start_time, duration_hours, justification, ticket):
+    fields = [
+        {"type": "mrkdwn", "text": f"*Conta:*\n{account}"},
+        {"type": "mrkdwn", "text": f"*Role:*\n{role}"},
+        {"type": "mrkdwn", "text": f"*Início:*\n{start_time}"},
+        {"type": "mrkdwn", "text": f"*Duração:*\n{format_slack_duration(duration_hours)}"},
+        {"type": "mrkdwn", "text": f"*Justificativa:*\n{justification or '-'}"},
+    ]
+    if ticket:
+        fields.append({"type": "mrkdwn", "text": f"*Ticket:*\n{ticket}"})
+
+    return [
+        {"type": "section", "text": {"type": "mrkdwn", "text": message}},
+        {"type": "section", "fields": fields},
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": button["text"]},
+                    "url": button["url"],
+                    "action_id": "button-action",
+                    **({"style": "primary"} if button.get("primary") else {}),
+                }
+            ],
+        },
+    ]
+
+
 def send_slack_notifications(
+    status,
     recipients,
-    message,
-    audit_message,
-    login_url,
+    requester,
+    approver,
+    approvers,
+    error,
+    team_url,
     request_start_time,
     role,
     account,
@@ -106,129 +185,84 @@ def send_slack_notifications(
         )
         return
 
-    parsed_date = parser.parse(request_start_time)
+    slack_users = {}
+
+    def get_slack_user(email):
+        if email not in slack_users:
+            try:
+                slack_users[email] = slack_client.users_lookupByEmail(email=email)["user"]
+            except Exception as error:
+                print(f"Error getting Slack user info for {email}: {error}")
+                slack_users[email] = None
+        return slack_users[email]
+
+    def mention(email):
+        slack_user = get_slack_user(email) if email else None
+        return f"<@{slack_user['id']}>" if slack_user else (email or "-")
+
+    def mention_all():
+        return ", ".join(mention(email) for email in approvers or []) or "aprovadores"
+
+    direct_message, channel_message = slack_messages(
+        status, requester, approver, error, mention, mention_all
+    )
+
+    # Pending requests send approvers straight to the approvals page
+    if status == "pending":
+        button = {
+            "text": "Revisar no TEAM",
+            "url": f"{team_url}/approvals/approve",
+            "primary": True,
+        }
+    else:
+        button = {"text": "Abrir no TEAM", "url": team_url}
 
     for recipient in recipients:
-        try:
-            recipient_slack_user = slack_client.users_lookupByEmail(email=recipient)
-            recipient_slack_id = recipient_slack_user["user"]["id"]
-            recipient_timezone = tz.gettz(name=recipient_slack_user["user"]["tz"])
-        except Exception as error:
-            print(f"Error getting Slack user info for {recipient}: {error}")
+        recipient_slack_user = get_slack_user(recipient)
+        if not recipient_slack_user:
             continue
 
         # Format date, localized to recipient's timezone
-        localized_date = parsed_date.astimezone(recipient_timezone)
-        formatted_date = localized_date.strftime("%B %d, %Y at %I:%M %p %Z")
-
-        # Build message using Slack blocks
-        message_blocks = [
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"*{message}*",
-                },
-                "accessory": {
-                    "type": "button",
-                    "text": {
-                        "type": "plain_text",
-                        "text": "Open TEAM",
-                    },
-                    "url": login_url,
-                    "action_id": "button-action",
-                },
-            },
-            {
-                "type": "section",
-                "fields": [
-                    {
-                        "type": "mrkdwn",
-                        "text": f"*Account:*\n{account}",
-                    },
-                    {
-                        "type": "mrkdwn",
-                        "text": f"*Start time:*\n{formatted_date}",
-                    },
-                    {"type": "mrkdwn", "text": f"*Role:*\n{role}"},
-                    {
-                        "type": "mrkdwn",
-                        "text": f"*Duration:*\n{duration_hours} hours",
-                    },
-                    {
-                        "type": "mrkdwn",
-                        "text": f"*Justification:*\n{justification}",
-                    },
-                    {
-                        "type": "mrkdwn",
-                        "text": f"*Ticket Number:*\n{ticket}",
-                    },
-                ],
-            },
-        ]
+        recipient_timezone = tz.gettz(name=recipient_slack_user["tz"])
+        message_blocks = slack_blocks(
+            direct_message,
+            button,
+            account,
+            role,
+            format_slack_date(request_start_time, recipient_timezone),
+            duration_hours,
+            justification,
+            ticket,
+        )
 
         # Send message to user
         try:
             slack_client.chat_postMessage(
-                channel=recipient_slack_id,
+                channel=recipient_slack_user["id"],
                 blocks=message_blocks,
-                text="AWS Access Request Notification",
+                text=direct_message,
             )
         except Exception as error:
             print(
-                f"Error posting chat message to channel/user id {recipient_slack_id}: {error}"
+                f"Error posting chat message to channel/user id {recipient_slack_user['id']}: {error}"
             )
 
     # send audit notifications to channel if defined
-    if slack_audit_notifications_channel and audit_message:
+    if slack_audit_notifications_channel and channel_message:
         try:
             slack_client.chat_postMessage(
                 channel=slack_audit_notifications_channel,
-                text="AWS Access Request Audit Notification",
-                blocks=[
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": f"*{audit_message}*",
-                        },
-                        "accessory": {
-                            "type": "button",
-                            "text": {
-                                "type": "plain_text",
-                                "text": "Open TEAM",
-                            },
-                            "url": login_url,
-                            "action_id": "button-action",
-                        },
-                    },
-                    {
-                        "type": "section",
-                        "fields": [
-                            {
-                                "type": "mrkdwn",
-                                "text": f"*Account:*\n{account}",
-                            },
-                            {
-                                "type": "mrkdwn",
-                                "text": f"*Start time:*\n{formatted_date}",
-                            },
-                            {"type": "mrkdwn", "text": f"*Role:*\n{role}"},
-                            {
-                                "type": "mrkdwn",
-                                "text": f"*Duration:*\n{duration_hours} hours",
-                            },
-                            {
-                                "type": "mrkdwn",
-                                "text": f"*Justification:*\n{justification}",
-                            },
-                            {
-                                "type": "mrkdwn",
-                                "text": f"*Ticket Number:*\n{ticket}",
-                            },
-                        ],
-                    },
-                ],
+                text=channel_message,
+                blocks=slack_blocks(
+                    channel_message,
+                    button,
+                    account,
+                    role,
+                    format_slack_date(request_start_time, SLACK_CHANNEL_TIMEZONE),
+                    duration_hours,
+                    justification,
+                    ticket,
+                ),
             )
         except Exception as error:
             print(
@@ -292,17 +326,13 @@ def lambda_handler(event: dict, context):
     ticket = event.get("ticketNo", "No ticket provided")
     login_url = event["sso_login_url"]
     sns_message = json.dumps(event)
-    slack_audit_message = ""
+    team_url = os.getenv("TEAM_URL", "").rstrip("/") or login_url
 
     match request_status:
         case "pending":
             if approval_required:
                 # Notify approvers pending request
                 slack_recipients = approvers
-                slack_message = f"<mailto:{requester}|{requester}> requests access to AWS, please approve or reject this request in TEAM."
-                slack_audit_message = (
-                    f"<mailto:{requester}|{requester}> has requested access to AWS"
-                )
                 email_to_addresses = approvers
                 email_cc_addresses = [requester]
                 subject = f"Access request to AWS account - {account}"
@@ -315,7 +345,6 @@ def lambda_handler(event: dict, context):
                 return
             # Notify requester request scheduled
             slack_recipients = [requester]
-            slack_message = f"Your AWS access session is scheduled."
             email_to_addresses = [requester]
             email_cc_addresses = []
             subject = f"Scheduled access session for {account}"
@@ -323,7 +352,6 @@ def lambda_handler(event: dict, context):
         case "expired":
             # Notify requester request expired
             slack_recipients = [requester]
-            slack_message = "Your AWS access request has expired."
             email_to_addresses = [requester]
             email_cc_addresses = approvers if approval_required else []
             subject = f"Expired access request for {account}"
@@ -331,7 +359,6 @@ def lambda_handler(event: dict, context):
         case "ended":
             # Notify requester ended
             slack_recipients = [requester]
-            slack_message = "Your AWS access session has ended."
             email_to_addresses = [requester]
             email_cc_addresses = approvers if approval_required else []
             subject = f"AWS access session ended for {account}"
@@ -339,7 +366,6 @@ def lambda_handler(event: dict, context):
         case "granted":
             # Notify requester access granted
             slack_recipients = [requester]
-            slack_message = "Your AWS access session has started."
             email_to_addresses = [requester]
             email_cc_addresses = approvers if approval_required else []
             subject = f"AWS access session started for {account}"
@@ -347,17 +373,13 @@ def lambda_handler(event: dict, context):
         case "approved":
             # Notify requester request approved
             slack_recipients = approvers + [requester]
-            slack_message = f"AWS access request was approved by {event['approver']}."
             email_to_addresses = [requester]
             email_cc_addresses = approvers
             subject = f"AWS access request approved for {account}"
-            slack_audit_message = f"AWS access request by <mailto:{requester}|{requester}> was approved by {event['approver']}"
             email_message_html = f'<html><body><p>Your AWS access request has been approved by {event["approver"]}. You will receive a notification when the session has started. Open <a href="{login_url}">TEAM</a> to manage AWS access requests.</p><p><b>Account:</b> {account}<br /><b>Role:</b> {role}<br /><b>Start Time:</b> {request_start_time}<br /><b>Duration:</b> {duration_hours} hours<br /><b>Justification:</b> {justification}<br /><b>Ticket Number:</b> {ticket}<br /></p></body></html>'
         case "rejected":
             # Notify requester request rejected
             slack_recipients = approvers + [requester]
-            slack_message = "AWS access request was rejected."
-            slack_audit_message = f"AWS access request by <mailto:{requester}|{requester}> was rejected by {event['approver']}"
             email_to_addresses = [requester]
             email_cc_addresses = approvers
             subject = f"AWS access request rejected for {account}"
@@ -365,18 +387,13 @@ def lambda_handler(event: dict, context):
         case "cancelled":
             # Notify approvers request cancelled
             slack_recipients = approvers
-            slack_message = f"{requester} cancelled this AWS access request."
             email_to_addresses = approvers
             email_cc_addresses = [requester]
             subject = f"AWS access request cancelled for {account}"
-            slack_audit_message = (
-                f"AWS access request by <mailto:{requester}|{requester}> was cancelled"
-            )
             email_message_html = f'<html><body><p>{requester} cancelled an AWS access request. Open <a href="{login_url}">TEAM</a> to manage AWS access requests.</p><p><b>Account:</b> {account}<br /><b>Role:</b> {role}<br /><b>Start Time:</b> {request_start_time}<br /><b>Duration:</b> {duration_hours} hours<br /><b>Justification:</b> {justification}<br /><b>Ticket Number:</b> {ticket}<br /></p></body></html>'
         case "error":
             # Notify approvers and requester error
             slack_recipients = approvers + [requester]
-            slack_message = f"Error handling AWS access for {requester}. Error details: {event.get('statusError')}"
             email_to_addresses = [ses_source_email]
             email_cc_addresses = approvers + [requester]
             subject = f"Error handling AWS access for {account}"
@@ -404,14 +421,17 @@ def lambda_handler(event: dict, context):
 
     if slack_notifications_enabled:
         send_slack_notifications(
+            status=request_status,
             recipients=slack_recipients,
-            message=slack_message,
-            audit_message=slack_audit_message,
-            login_url=login_url,
+            requester=requester,
+            approver=event.get("approver", ""),
+            approvers=approvers,
+            error=event.get("statusError"),
+            team_url=team_url,
             role=role,
             account=account,
             request_start_time=request_start_time,
             duration_hours=duration_hours,
-            justification=justification,
-            ticket=ticket,
+            justification=event.get("justification", ""),
+            ticket=event.get("ticketNo", ""),
         )
